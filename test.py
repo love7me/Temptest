@@ -1,158 +1,202 @@
+# Copyright (c) Meta Platforms, Inc. and affiliates.
+
+# All rights reserved.
+
+# This source code is licensed under the license found in the
+# LICENSE file in the root directory of this source tree.
+
+
 import torch
-from torch import nn
+import torch.nn as nn
+import torch.nn.functional as F
+from timm.models.layers import trunc_normal_, DropPath
+from timm.models.registry import register_model
 
-#需要分类的类别数
-classes=6
-
-#SE模块
-class SEModule(nn.Module):
-    def __init__(self, channels, reduction=16):
-        super(SEModule, self).__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.fc1 = nn.Conv2d(channels, channels // reduction, kernel_size=1, padding=0)
-        self.relu = nn.ReLU(inplace=True)
-        self.fc2 = nn.Conv2d(channels // reduction, channels, kernel_size=1, padding=0)
-        self.sigmoid = nn.Sigmoid()
-
-    def forward(self, input):
-        x = self.avg_pool(input)
-        x = self.fc1(x)
-        x = self.relu(x)
-        x = self.fc2(x)
-        x = self.sigmoid(x)
-        return input * x
-
-class Res2NetBottleneck(nn.Module):
-    expansion = 4  #残差块的输出通道数=输入通道数*expansion
-    def __init__(self, inplanes, planes, downsample=None, stride=1, scales=4, groups=1, se=True,  norm_layer=True):
-        #scales为残差块中使用分层的特征组数，groups表示其中3*3卷积层数量，SE模块和BN层
-        super(Res2NetBottleneck, self).__init__()
-
-        if planes % scales != 0: #输出通道数为4的倍数
-            raise ValueError('Planes must be divisible by scales')
-        if norm_layer:  #BN层
-            norm_layer = nn.BatchNorm2d
-
-        bottleneck_planes = groups * planes
-        self.scales = scales
-        self.stride = stride
-        self.downsample = downsample
-        #1*1的卷积层,在第二个layer时缩小图片尺寸
-        self.conv1 = nn.Conv2d(inplanes, bottleneck_planes, kernel_size=1, stride=stride)
-        self.bn1 = norm_layer(bottleneck_planes)
-        #3*3的卷积层，一共有3个卷积层和3个BN层
-        self.conv2 = nn.ModuleList([nn.Conv2d(bottleneck_planes // scales, bottleneck_planes // scales,
-                                              kernel_size=3, stride=1, padding=1, groups=groups) for _ in range(scales-1)])
-        self.bn2 = nn.ModuleList([norm_layer(bottleneck_planes // scales) for _ in range(scales-1)])
-        #1*1的卷积层，经过这个卷积层之后输出的通道数变成
-        self.conv3 = nn.Conv2d(bottleneck_planes, planes * self.expansion, kernel_size=1, stride=1)
-        self.bn3 = norm_layer(planes * self.expansion)
-        self.relu = nn.ReLU(inplace=True)
-        #SE模块
-        self.se = SEModule(planes * self.expansion) if se else None
+class Block(nn.Module):
+    r""" ConvNeXt Block. There are two equivalent implementations:
+    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
+    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
+    We use (2) as we find it slightly faster in PyTorch
+    
+    Args:
+        dim (int): Number of input channels.
+        drop_path (float): Stochastic depth rate. Default: 0.0
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+    """
+    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
+        super().__init__()
+        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
+        self.norm = LayerNorm(dim, eps=1e-6)
+        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
+        self.act = nn.GELU()
+        self.pwconv2 = nn.Linear(4 * dim, dim)
+        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
+                                    requires_grad=True) if layer_scale_init_value > 0 else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
 
     def forward(self, x):
-        identity = x
+        input = x
+        x = self.dwconv(x)
+        x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
+        x = self.norm(x)
+        x = self.pwconv1(x)
+        x = self.act(x)
+        x = self.pwconv2(x)
+        if self.gamma is not None:
+            x = self.gamma * x
+        x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
 
-        #1*1的卷积层
-        out = self.conv1(x)
-        out = self.bn1(out)
-        out = self.relu(out)
-
-        #scales个(3x3)的残差分层架构
-        xs = torch.chunk(out, self.scales, 1) #将x分割成scales块
-        ys = []
-        for s in range(self.scales):
-            if s == 0:
-                ys.append(xs[s])
-            elif s == 1:
-                ys.append(self.relu(self.bn2[s-1](self.conv2[s-1](xs[s]))))
-            else:
-                ys.append(self.relu(self.bn2[s-1](self.conv2[s-1](xs[s] + ys[-1]))))
-        out = torch.cat(ys, 1)
-
-        #1*1的卷积层
-        out = self.conv3(out)
-        out = self.bn3(out)
-
-        #加入SE模块
-        if self.se is not None:
-            out = self.se(out)
-        #下采样
-        if self.downsample:
-            identity = self.downsample(identity)
-
-        out += identity
-        out = self.relu(out)
-
-        return out
-
-class Res2Net(nn.Module):
-    def __init__(self, layers, num_classes, width=16, scales=4, groups=1,
-                 zero_init_residual=True, se=True, norm_layer=True):
-        super(Res2Net, self).__init__()
-        if norm_layer:  #BN层
-            norm_layer = nn.BatchNorm2d
-        #通道数分别为64,128,256,512
-        planes = [int(width * scales * 2 ** i) for i in range(4)]
-        self.inplanes = planes[0]
-
-        #7*7的卷积层，3*3的最大池化层
-        self.conv1 = nn.Conv2d(3, planes[0], kernel_size=7, stride=2, padding=3,
-                               bias=False)
-        self.bn1 = norm_layer(planes[0])
-        self.relu = nn.ReLU(inplace=True)
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        #四个残差块
-        self.layer1 = self._make_layer(Res2NetBottleneck, planes[0], layers[0], stride=1, scales=scales, groups=groups, se=se, norm_layer=norm_layer)
-        self.layer2 = self._make_layer(Res2NetBottleneck, planes[1], layers[1], stride=2, scales=scales, groups=groups, se=se, norm_layer=norm_layer)
-        self.layer3 = self._make_layer(Res2NetBottleneck, planes[2], layers[2], stride=2, scales=scales, groups=groups, se=se, norm_layer=norm_layer)
-        self.layer4 = self._make_layer(Res2NetBottleneck, planes[3], layers[3], stride=2, scales=scales, groups=groups, se=se, norm_layer=norm_layer)
-        #自适应平均池化，全连接层
-        self.avgpool = nn.AdaptiveAvgPool2d((1, 1))
-
-        #初始化
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm)):
-                nn.init.constant_(m.weight, 1)
-                nn.init.constant_(m.bias, 0)
-        #零初始化每个剩余分支中的最后一个BN，以便剩余分支从零开始，并且每个剩余块的行为类似于一个恒等式
-        if zero_init_residual:
-            for m in self.modules():
-                if isinstance(m, Res2NetBottleneck):
-                    nn.init.constant_(m.bn3.weight, 0)
-
-    def _make_layer(self, block, planes, blocks, stride=1, scales=4, groups=1, se=True, norm_layer=True):
-        if norm_layer:
-            norm_layer = nn.BatchNorm2d
-
-        downsample = None  #下采样，可缩小图片尺寸
-        if stride != 1 or self.inplanes != planes * block.expansion:
-            downsample = nn.Sequential(
-                nn.Conv2d(self.inplanes, planes * block.expansion, kernel_size=1, stride=stride),
-                norm_layer(planes * block.expansion),
-            )
-
-        layers = []
-        layers.append(block(self.inplanes, planes, downsample, stride=stride, scales=scales, groups=groups, se=se, norm_layer=norm_layer))
-        self.inplanes = planes * block.expansion
-        for _ in range(1, blocks):
-            layers.append(block(self.inplanes, planes, scales=scales, groups=groups, se=se, norm_layer=norm_layer))
-
-        return nn.Sequential(*layers)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.bn1(x)
-        x = self.relu(x)
-        x = self.maxpool(x)
-
-        x = self.layer1(x)
-        x = self.layer2(x)
-        x = self.layer3(x)
-        x = self.layer4(x)
-        
-
+        x = input + self.drop_path(x)
         return x
+
+class ConvNeXt(nn.Module):
+    r""" ConvNeXt
+        A PyTorch impl of : `A ConvNet for the 2020s`  -
+          https://arxiv.org/pdf/2201.03545.pdf
+
+    Args:
+        in_chans (int): Number of input image channels. Default: 3
+        num_classes (int): Number of classes for classification head. Default: 1000
+        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
+        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
+        drop_path_rate (float): Stochastic depth rate. Default: 0.
+        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
+    """
+    def __init__(self, in_chans=3, num_classes=1000, 
+                 depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0., 
+                 layer_scale_init_value=1e-6, head_init_scale=1.,
+                 ):
+        super().__init__()
+
+        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
+        stem = nn.Sequential(
+            nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
+            LayerNorm(dims[0], eps=1e-6, data_format="channels_first")
+        )
+        self.downsample_layers.append(stem)
+        for i in range(3):
+            downsample_layer = nn.Sequential(
+                    LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
+                    nn.Conv2d(dims[i], dims[i+1], kernel_size=2, stride=2),
+            )
+            self.downsample_layers.append(downsample_layer)
+
+        self.stages = nn.ModuleList() # 4 feature resolution stages, each consisting of multiple residual blocks
+        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
+        cur = 0
+        for i in range(4):
+            stage = nn.Sequential(
+                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], 
+                layer_scale_init_value=layer_scale_init_value) for j in range(depths[i])]
+            )
+            self.stages.append(stage)
+            cur += depths[i]
+
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6) # final norm layer
+        self.head = nn.Linear(dims[-1], num_classes)
+
+        self.apply(self._init_weights)
+        self.head.weight.data.mul_(head_init_scale)
+        self.head.bias.data.mul_(head_init_scale)
+
+    def _init_weights(self, m):
+        if isinstance(m, (nn.Conv2d, nn.Linear)):
+            trunc_normal_(m.weight, std=.02)
+            nn.init.constant_(m.bias, 0)
+
+    def forward_features(self, x):
+        for i in range(4):
+            x = self.downsample_layers[i](x)
+            x = self.stages[i](x)
+        return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
+
+    def forward(self, x):
+        x = self.forward_features(x)
+        x = self.head(x)
+        return x
+
+class LayerNorm(nn.Module):
+    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
+    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
+    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
+    with shape (batch_size, channels, height, width).
+    """
+    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
+        super().__init__()
+        self.weight = nn.Parameter(torch.ones(normalized_shape))
+        self.bias = nn.Parameter(torch.zeros(normalized_shape))
+        self.eps = eps
+        self.data_format = data_format
+        if self.data_format not in ["channels_last", "channels_first"]:
+            raise NotImplementedError 
+        self.normalized_shape = (normalized_shape, )
+    
+    def forward(self, x):
+        if self.data_format == "channels_last":
+            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        elif self.data_format == "channels_first":
+            u = x.mean(1, keepdim=True)
+            s = (x - u).pow(2).mean(1, keepdim=True)
+            x = (x - u) / torch.sqrt(s + self.eps)
+            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            return x
+
+
+model_urls = {
+    "convnext_tiny_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth",
+    "convnext_small_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_1k_224_ema.pth",
+    "convnext_base_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_1k_224_ema.pth",
+    "convnext_large_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_1k_224_ema.pth",
+    "convnext_tiny_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_224.pth",
+    "convnext_small_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_224.pth",
+    "convnext_base_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_224.pth",
+    "convnext_large_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_224.pth",
+    "convnext_xlarge_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_224.pth",
+}
+
+@register_model
+def convnext_tiny(pretrained=False,in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs)
+    if pretrained:
+        url = model_urls['convnext_tiny_22k'] if in_22k else model_urls['convnext_tiny_1k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu", check_hash=True)
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+@register_model
+def convnext_small(pretrained=False,in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768], **kwargs)
+    if pretrained:
+        url = model_urls['convnext_small_22k'] if in_22k else model_urls['convnext_small_1k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+@register_model
+def convnext_base(pretrained=False, in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024], **kwargs)
+    if pretrained:
+        url = model_urls['convnext_base_22k'] if in_22k else model_urls['convnext_base_1k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+@register_model
+def convnext_large(pretrained=False, in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], **kwargs)
+    if pretrained:
+        url = model_urls['convnext_large_22k'] if in_22k else model_urls['convnext_large_1k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    return model
+
+@register_model
+def convnext_xlarge(pretrained=False, in_22k=False, **kwargs):
+    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048], **kwargs)
+    if pretrained:
+        assert in_22k, "only ImageNet-22K pre-trained ConvNeXt-XL is available; please set in_22k=True"
+        url = model_urls['convnext_xlarge_22k']
+        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
+        model.load_state_dict(checkpoint["model"])
+    return model
