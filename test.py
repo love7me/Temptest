@@ -1,202 +1,391 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
+# Copyright (c) OpenMMLab. All rights reserved.
+import numpy as np
 
-# All rights reserved.
-
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
-
-import torch
 import torch.nn as nn
+import torch
 import torch.nn.functional as F
-from timm.models.layers import trunc_normal_, DropPath
-from timm.models.registry import register_model
+from timm.models.layers import trunc_normal_
+from einops import rearrange
+from rsseg.models.basemodules.dysample import DySample
 
-class Block(nn.Module):
-    r""" ConvNeXt Block. There are two equivalent implementations:
-    (1) DwConv -> LayerNorm (channels_first) -> 1x1 Conv -> GELU -> 1x1 Conv; all in (N, C, H, W)
-    (2) DwConv -> Permute to (N, H, W, C); LayerNorm (channels_last) -> Linear -> GELU -> Linear; Permute back
-    We use (2) as we find it slightly faster in PyTorch
-    
-    Args:
-        dim (int): Number of input channels.
-        drop_path (float): Stochastic depth rate. Default: 0.0
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
+def patch_split(input, patch_size):
     """
-    def __init__(self, dim, drop_path=0., layer_scale_init_value=1e-6):
-        super().__init__()
-        self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim) # depthwise conv
-        self.norm = LayerNorm(dim, eps=1e-6)
-        self.pwconv1 = nn.Linear(dim, 4 * dim) # pointwise/1x1 convs, implemented with linear layers
-        self.act = nn.GELU()
-        self.pwconv2 = nn.Linear(4 * dim, dim)
-        self.gamma = nn.Parameter(layer_scale_init_value * torch.ones((dim)), 
-                                    requires_grad=True) if layer_scale_init_value > 0 else None
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-
-    def forward(self, x):
-        input = x
-        x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1) # (N, C, H, W) -> (N, H, W, C)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        if self.gamma is not None:
-            x = self.gamma * x
-        x = x.permute(0, 3, 1, 2) # (N, H, W, C) -> (N, C, H, W)
-
-        x = input + self.drop_path(x)
-        return x
-
-class ConvNeXt(nn.Module):
-    r""" ConvNeXt
-        A PyTorch impl of : `A ConvNet for the 2020s`  -
-          https://arxiv.org/pdf/2201.03545.pdf
-
-    Args:
-        in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
-        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
-        drop_path_rate (float): Stochastic depth rate. Default: 0.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        head_init_scale (float): Init scaling value for classifier weights and biases. Default: 1.
+    input: (B, C, H, W)
+    output: (B*num_h*num_w, C, patch_h, patch_w)
     """
-    def __init__(self, in_chans=3, num_classes=1000, 
-                 depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], drop_path_rate=0., 
-                 layer_scale_init_value=1e-6, head_init_scale=1.,
-                 ):
+    B, C, H, W = input.size()
+    num_h, num_w = patch_size
+    patch_h, patch_w = H // num_h, W // num_w
+    out = input.view(B, C, num_h, patch_h, num_w, patch_w)
+    out = out.permute(0, 2, 4, 1, 3, 5).contiguous().view(-1, C, patch_h,
+                                                          patch_w)  # (B*num_h*num_w, C, patch_h, patch_w)
+    return out
+
+
+def patch_recover(input, patch_size):
+    """
+    input: (B*num_h*num_w, C, patch_h, patch_w)
+    output: (B, C, H, W)
+    """
+    N, C, patch_h, patch_w = input.size()
+    num_h, num_w = patch_size
+    H, W = num_h * patch_h, num_w * patch_w
+    B = N // (num_h * num_w)
+
+    out = input.view(B, num_h, num_w, C, patch_h, patch_w)
+    out = out.permute(0, 3, 1, 4, 2, 5).contiguous().view(B, C, H, W)
+    return out
+
+
+
+
+class RVSA_MRAM(nn.Module):
+    def __init__(self, dim, num_heads,
+                 num_classes,out_dim=None, qkv_bias=True, qk_scale=None,
+                learnable=True,
+                restart_regression=True,num_deform=None,
+                patch_size = (4,4)):
         super().__init__()
 
-        self.downsample_layers = nn.ModuleList() # stem and 3 intermediate downsampling conv layers
-        stem = nn.Sequential(
-            nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
-            LayerNorm(dims[0], eps=1e-6, data_format="channels_first")
+        self.feat_decoder = nn.Conv2d(dim, num_classes, kernel_size=1)
+        self.patch_size = patch_size
+
+        self.num_heads = num_heads
+        self.dim = dim
+        out_dim = out_dim or dim
+        self.out_dim = out_dim
+        head_dim = dim // self.num_heads
+
+        self.learnable = learnable
+        self.restart_regression = restart_regression
+        if self.learnable:
+            # if num_deform is None, we set num_deform to num_heads as default
+
+            if num_deform is None:
+                num_deform = 1
+            self.num_deform = num_deform
+
+            self.sampling_offsets = nn.Sequential(
+                nn.AdaptiveAvgPool2d([1,1]),
+                nn.LeakyReLU(),
+                nn.Conv2d(dim, self.num_heads * self.num_deform * 2, kernel_size=1, stride=1)
+            )
+            self.sampling_scales = nn.Sequential(
+                nn.AdaptiveAvgPool2d([1,1]),
+                nn.LeakyReLU(),
+                nn.Conv2d(dim, self.num_heads * self.num_deform * 2, kernel_size=1, stride=1)
+            )
+            # add angle
+            self.sampling_angles = nn.Sequential(
+                nn.AdaptiveAvgPool2d([1,1]),
+                nn.LeakyReLU(),
+                nn.Conv2d(dim, self.num_heads * self.num_deform * 1, kernel_size=1, stride=1)
+            )
+            self._reset_parameters()
+
+        self.scale = qk_scale or head_dim ** -0.5
+
+        self.q = nn.Linear(dim, out_dim, bias=qkv_bias)
+        self.k = nn.Linear(dim, out_dim, bias=qkv_bias)
+        self.v = nn.Linear(dim, out_dim, bias=qkv_bias)
+        self.out_project = nn.Linear(dim, out_dim, bias=qkv_bias)
+
+        self.cat_conv = nn.Sequential(
+            conv_3x3(out_dim * 2, out_dim),
+            nn.Dropout2d(0.1),
+            conv_3x3(out_dim, out_dim),
+            nn.Dropout2d(0.1)
         )
-        self.downsample_layers.append(stem)
-        for i in range(3):
-            downsample_layer = nn.Sequential(
-                    LayerNorm(dims[i], eps=1e-6, data_format="channels_first"),
-                    nn.Conv2d(dims[i], dims[i+1], kernel_size=2, stride=2),
+
+    '''
+    x:[b,c,h,w]
+    global_center:[b,k,c]
+    '''
+    def forward(self, x,global_center):
+        shortcut = x
+        B, C, H, W = x.shape
+        probs = self.feat_decoder(x)
+        K = probs.shape[1]
+        probs = probs.view(B, K, -1)  # batch * k * hw
+        probs = F.softmax(probs, dim=2).reshape(B,K,H,W)
+
+
+        patch_x = patch_split(x,self.patch_size)
+
+        window_size_h = patch_x.shape[-2]
+        window_size_w = patch_x.shape[-1]
+
+        # padding on left-right-up-down
+        expand_h, expand_w = H, W
+
+        # window num in padding features
+        window_num_h = self.patch_size[0]
+        window_num_w = self.patch_size[1]
+
+        #前面这些操作是为了补齐窗口大小
+        image_reference_h = torch.linspace(-1, 1, expand_h).to(x.device)
+        image_reference_w = torch.linspace(-1, 1, expand_w).to(x.device)
+        image_reference = torch.stack(torch.meshgrid(image_reference_w, image_reference_h), 0)\
+            .permute(0, 2,1).unsqueeze(0)  # 1, 2, H, W
+
+        # position of the window relative to the image center
+        window_reference = nn.functional.avg_pool2d(image_reference, kernel_size=[window_size_h,window_size_w])  # 1,2, nh, nw
+        image_reference = image_reference.reshape(1, 2, window_num_h, window_size_h, window_num_w,
+                                                  window_size_w)  # 1, 2, nh, ws, nw, ws
+        assert window_num_h == window_reference.shape[-2]
+        assert window_num_w == window_reference.shape[-1]
+
+        window_reference = window_reference.reshape(1, 2, window_num_h, 1, window_num_w, 1)  # 1,2, nh,1, nw,1
+        # coords of pixels in each window
+
+        base_coords_h = torch.arange(window_size_h).to(x.device) * 2 * window_size_h / window_size_h / (expand_h - 1)  # ws
+        base_coords_h = (base_coords_h - base_coords_h.mean())
+        base_coords_w = torch.arange(window_size_w).to(x.device) * 2 * window_size_w / window_size_w / (expand_w - 1)
+        base_coords_w = (base_coords_w - base_coords_w.mean())
+        # base_coords = torch.stack(torch.meshgrid(base_coords_w, base_coords_h), 0).permute(0, 2, 1).reshape(1, 2, 1, self.attn_ws, 1, self.attn_ws)
+
+        # extend to each window
+        expanded_base_coords_h = base_coords_h.unsqueeze(dim=0).repeat(window_num_h, 1)  # ws -> 1,ws -> nh,ws
+        assert expanded_base_coords_h.shape[0] == window_num_h
+        assert expanded_base_coords_h.shape[1] == window_size_h
+
+        expanded_base_coords_w = base_coords_w.unsqueeze(dim=0).repeat(window_num_w, 1)  # nw,ws
+        assert expanded_base_coords_w.shape[0] == window_num_w
+        assert expanded_base_coords_w.shape[1] == window_size_w
+        expanded_base_coords_h = expanded_base_coords_h.reshape(-1)  # nh*ws
+        expanded_base_coords_w = expanded_base_coords_w.reshape(-1)  # nw*ws
+
+        window_coords = torch.stack(torch.meshgrid(expanded_base_coords_w, expanded_base_coords_h), 0).permute(0, 2,
+                                                                                                               1).reshape(
+            1, 2, window_num_h, window_size_h, window_num_w, window_size_w)  # 1, 2, nh, ws, nw, ws
+        # base_coords = window_reference+window_coords
+        base_coords = image_reference
+
+        if self.restart_regression:
+            # compute for each head in each batch
+            coords = base_coords.repeat(B * self.num_heads, 1, 1, 1, 1, 1)  # B*nH, 2, nh, ws, nw, ws
+        if self.learnable:
+            num_predict_total = B * self.num_heads * self.num_deform
+
+            # offset factors
+            sampling_offsets = self.sampling_offsets(patch_x) #[b*ph*pw,num_heads * 2,1]
+            sampling_offsets = sampling_offsets.reshape(B,window_num_h , window_num_w,self.num_heads * self.num_deform,2)
+            sampling_offsets = sampling_offsets.permute(0,3,4,1,2).contiguous()
+            sampling_offsets = sampling_offsets.reshape(num_predict_total,2, window_num_h , window_num_w)
+
+            #归一化
+            sampling_offsets[:, 0, ...] = sampling_offsets[:, 0, ...] / (H // window_num_h)
+            sampling_offsets[:, 1, ...] = sampling_offsets[:, 1, ...] / (W // window_num_w)
+
+            # scale fators
+            sampling_scales = self.sampling_scales(patch_x)  # B, heads*2, h // window_size, w // window_size
+            sampling_scales = sampling_scales.reshape(B,window_num_h , window_num_w,self.num_heads * self.num_deform,2)
+            sampling_scales = sampling_scales.permute(0,3,4,1,2).contiguous()
+            sampling_scales = sampling_scales.reshape(num_predict_total,2, window_num_h , window_num_w)
+
+            # rotate factor
+            sampling_angle = self.sampling_angles(patch_x)
+            sampling_angle = sampling_angle.reshape(B,window_num_h , window_num_w,self.num_heads * self.num_deform,1)
+            sampling_angle = sampling_angle.permute(0,3,4,1,2).contiguous()
+            sampling_angle = sampling_angle.reshape(num_predict_total,1,window_num_h , window_num_w)
+
+            # first scale
+            window_coords = window_coords * (sampling_scales[:, :, :, None, :, None] + 1)
+
+            # then rotate around window center
+
+            window_coords_r = window_coords.clone()
+
+            # 0:x,column, 1:y,row
+
+            window_coords_r[:, 0, :, :, :, :] = -window_coords[:, 1, :, :, :, :] * torch.sin(
+                sampling_angle[:, 0, :, None, :, None]) + window_coords[:, 0, :, :, :, :] * torch.cos(
+                sampling_angle[:, 0, :, None, :, None])
+            window_coords_r[:, 1, :, :, :, :] = window_coords[:, 1, :, :, :, :] * torch.cos(
+                sampling_angle[:, 0, :, None, :, None]) + window_coords[:, 0, :, :, :, :] * torch.sin(
+                sampling_angle[:, 0, :, None, :, None])
+
+            # system transformation: window center -> image center
+
+            coords = window_reference + window_coords_r + sampling_offsets[:, :, :, None, :, None]
+
+        # final offset
+        sample_coords = coords.permute(0, 2, 3, 4, 5, 1).contiguous().reshape(num_predict_total, window_size_h * window_num_h,
+                                                                 window_size_w * window_num_w, 2)
+        
+        #[b,h,w,c]
+        logcal_key = self.k(x.permute(0,2,3,1).contiguous()).permute(0,3,1,2).contiguous()
+
+        transform_x = F.grid_sample(
+            logcal_key.reshape(num_predict_total,
+                      self.dim // self.num_heads // self.num_deform,
+                      H,W),
+            grid=sample_coords, padding_mode='zeros', align_corners=True
+        ).reshape(num_predict_total,-1,
+                  window_num_h, window_size_h,
+                  window_num_w, window_size_w).permute(0,2,4,3,5,1).contiguous().reshape(-1,window_size_w*window_size_h,self.dim // self.num_heads // self.num_deform) #[B*wnh,wh*ww,C]
+        transform_probs = F.grid_sample(
+            probs.repeat(num_predict_total // B,1,1,1),
+            grid=sample_coords, padding_mode='zeros', align_corners=True
+        ).reshape(num_predict_total,K,
+                  window_num_h, window_size_h,
+                  window_num_w, window_size_w).permute(0,2,4,3,5,1).contiguous().reshape(-1,window_size_w*window_size_h,K) #[B*wnh,wh*ww,K]
+
+
+        #计算局部类中心作为key
+        logcal_center = torch.matmul(transform_probs.permute(0,2,1),transform_x) #[B,K,C]
+        logcal_center = logcal_center.reshape(B * window_num_w * window_num_h,self.num_heads,K,-1)
+        query = x.reshape(B,C,
+                  window_num_h, window_size_h,
+                  window_num_w, window_size_w).permute(0,2,4,3,5,1).contiguous().reshape(-1,window_size_w*window_size_h,C) #[B*wnh,wh*ww,C]
+
+        #[b,num_heads,c,hw]
+
+
+        query = self.q(query).permute(0,2,1).contiguous().reshape(
+            B * window_num_w * window_num_h,
+            self.num_heads,C // self.num_heads,
+            window_size_w*window_size_h) #[B,nds,c,wh*ww]
+
+        value = global_center.repeat(window_num_w * window_num_h,1,1)
+        value = self.v(value).permute(0,2,1).contiguous().reshape(
+            B * window_num_w * window_num_h,self.num_heads,
+            C // self.num_heads,K)#[B,nds,c,k]
+
+
+        query = query.permute(0,1,3,2).contiguous() #[B,nds,wh*ww,c]
+        dots = (query @ logcal_center.permute(0,1,3,2).contiguous()) * self.scale #[B,nds,wh*ww,K]
+
+
+        attn = dots.softmax(dim=-1)
+        out = attn @ value.permute(0,1,3,2).contiguous() #[B,num_heads,HW,C]
+
+        context = out.permute(0, 1, 3, 2).contiguous() #[B,num_heads,c,wh*ww]
+        context = context.reshape(B * window_num_w * window_num_h, C,-1).permute(0,2,1).contiguous()  # (B,wh*ww,C)
+
+        context = self.out_project(context).permute(0,2,1).contiguous().reshape(-1,C,window_size_h,window_size_w)  # (B*num_h*num_w, C, wh, ww)
+
+        context = patch_recover(context,self.patch_size)
+        
+        out = self.cat_conv(torch.cat([shortcut, context], dim=1))
+        return out
+
+    def _reset_parameters(self):
+        if self.learnable:
+            nn.init.constant_(self.sampling_offsets[-1].weight, 0.)
+            nn.init.constant_(self.sampling_offsets[-1].bias, 0.)
+            nn.init.constant_(self.sampling_scales[-1].weight, 0.)
+            nn.init.constant_(self.sampling_scales[-1].bias, 0.)
+
+
+
+
+def conv_3x3(in_channel, out_channel):
+    return nn.Sequential(
+        nn.Conv2d(in_channel, out_channel, kernel_size=3, stride=1, padding=1, bias=False),
+        nn.BatchNorm2d(out_channel),
+        nn.ReLU(inplace=True)
+    )
+
+class SpatialGatherModule(nn.Module):
+    def __init__(self, scale=1):
+        super(SpatialGatherModule, self).__init__()
+        self.scale = scale
+
+    def forward(self, features, probs):  # (B*num_h*num_w, C, patch_h, patch_w) (B*num_h*num_w, K, patch_h, patch_w)
+        batch_size, num_classes, h, w = probs.size()
+        probs = probs.view(batch_size, num_classes, -1)  # batch * k * hw
+        probs = F.softmax(self.scale * probs, dim=2)
+
+        features = features.view(batch_size, features.size(1), -1)
+        features = features.permute(0, 2, 1)  # batch * hw * c
+
+        ocr_context = torch.matmul(probs, features)  # (B, k, c)
+        return ocr_context
+
+
+def upsample_add(x_small, x_big):
+    x_small = F.interpolate(x_small, scale_factor=2, mode="bilinear", align_corners=False)
+    return torch.cat([x_small, x_big], dim=1)
+
+
+class LoGCANPlus_Head(nn.Module):
+
+    def __init__(self,
+                 transform_channel,
+                 in_channel,
+                 num_class,
+                 num_heads,
+                 patch_size):
+        super(LoGCANPlus_Head, self).__init__()
+
+
+        self.bottleneck1 = conv_3x3(in_channel[0], transform_channel)
+        self.bottleneck2 = conv_3x3(in_channel[1], transform_channel)
+        self.bottleneck3 = conv_3x3(in_channel[2], transform_channel)
+        self.bottleneck4 = conv_3x3(in_channel[3], transform_channel)
+
+        self.decoder_stage1 = nn.Conv2d(transform_channel, num_class, kernel_size=1)
+        self.global_gather = SpatialGatherModule()
+
+        self.center1 = RVSA_MRAM(
+                dim=transform_channel,
+                out_dim=transform_channel,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                num_classes=num_class
             )
-            self.downsample_layers.append(downsample_layer)
-
-        self.stages = nn.ModuleList() # 4 feature resolution stages, each consisting of multiple residual blocks
-        dp_rates=[x.item() for x in torch.linspace(0, drop_path_rate, sum(depths))] 
-        cur = 0
-        for i in range(4):
-            stage = nn.Sequential(
-                *[Block(dim=dims[i], drop_path=dp_rates[cur + j], 
-                layer_scale_init_value=layer_scale_init_value) for j in range(depths[i])]
+        self.center2 = RVSA_MRAM(
+                dim=transform_channel,
+                out_dim=transform_channel,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                num_classes=num_class
             )
-            self.stages.append(stage)
-            cur += depths[i]
+        self.center3 = RVSA_MRAM(
+                dim=transform_channel,
+                out_dim=transform_channel,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                num_classes=num_class
+            )
+        self.center4 = RVSA_MRAM(
+                dim=transform_channel,
+                out_dim=transform_channel,
+                num_heads=num_heads,
+                patch_size=patch_size,
+                num_classes=num_class
+            )
 
-        self.norm = nn.LayerNorm(dims[-1], eps=1e-6) # final norm layer
-        self.head = nn.Linear(dims[-1], num_classes)
+        self.catconv1 = conv_3x3(transform_channel * 2, transform_channel)
+        self.catconv2 = conv_3x3(transform_channel * 2, transform_channel)
+        self.catconv3 = conv_3x3(transform_channel * 2, transform_channel)
 
-        self.apply(self._init_weights)
-        self.head.weight.data.mul_(head_init_scale)
-        self.head.bias.data.mul_(head_init_scale)
+        self.catconv = conv_3x3(transform_channel, transform_channel)
 
-    def _init_weights(self, m):
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            trunc_normal_(m.weight, std=.02)
-            nn.init.constant_(m.bias, 0)
+    def forward(self, x_list):
+        feat1, feat2, feat3, feat4 = self.bottleneck1(x_list[0]), self.bottleneck2(x_list[1]), self.bottleneck3(
+            x_list[2]), self.bottleneck4(x_list[3])
 
-    def forward_features(self, x):
-        for i in range(4):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-        return self.norm(x.mean([-2, -1])) # global average pooling, (N, C, H, W) -> (N, C)
+        pred1 = self.decoder_stage1(feat4)
+        global_center = self.global_gather(feat4, pred1)
 
-    def forward(self, x):
-        x = self.forward_features(x)
-        x = self.head(x)
-        return x
+        # [b,h,w,k]
+        new_feat4 = self.center4(feat4, global_center)
 
-class LayerNorm(nn.Module):
-    r""" LayerNorm that supports two data formats: channels_last (default) or channels_first. 
-    The ordering of the dimensions in the inputs. channels_last corresponds to inputs with 
-    shape (batch_size, height, width, channels) while channels_first corresponds to inputs 
-    with shape (batch_size, channels, height, width).
-    """
-    def __init__(self, normalized_shape, eps=1e-6, data_format="channels_last"):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(normalized_shape))
-        self.bias = nn.Parameter(torch.zeros(normalized_shape))
-        self.eps = eps
-        self.data_format = data_format
-        if self.data_format not in ["channels_last", "channels_first"]:
-            raise NotImplementedError 
-        self.normalized_shape = (normalized_shape, )
-    
-    def forward(self, x):
-        if self.data_format == "channels_last":
-            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
-            return x
+        feat3 = self.catconv1(upsample_add(new_feat4, feat3))
+        new_feat3 = self.center3(feat3, global_center)
 
+        feat2 = self.catconv2(upsample_add(new_feat3, feat2))
+        new_feat2 = self.center2(feat2, global_center)
 
-model_urls = {
-    "convnext_tiny_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_1k_224_ema.pth",
-    "convnext_small_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_1k_224_ema.pth",
-    "convnext_base_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_1k_224_ema.pth",
-    "convnext_large_1k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_1k_224_ema.pth",
-    "convnext_tiny_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_tiny_22k_224.pth",
-    "convnext_small_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_small_22k_224.pth",
-    "convnext_base_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_base_22k_224.pth",
-    "convnext_large_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_large_22k_224.pth",
-    "convnext_xlarge_22k": "https://dl.fbaipublicfiles.com/convnext/convnext_xlarge_22k_224.pth",
-}
+        feat1 = self.catconv3(upsample_add(new_feat2, feat1))
+        new_feat1 = self.center1(feat1, global_center)
 
-@register_model
-def convnext_tiny(pretrained=False,in_22k=False, **kwargs):
-    model = ConvNeXt(depths=[3, 3, 9, 3], dims=[96, 192, 384, 768], **kwargs)
-    if pretrained:
-        url = model_urls['convnext_tiny_22k'] if in_22k else model_urls['convnext_tiny_1k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu", check_hash=True)
-        model.load_state_dict(checkpoint["model"])
-    return model
+        new_feat4 = F.interpolate(new_feat4, scale_factor=8, mode="bilinear", align_corners=False)
+        new_feat3 = F.interpolate(new_feat3, scale_factor=4, mode="bilinear", align_corners=False)
+        new_feat2 = F.interpolate(new_feat2, scale_factor=2, mode="bilinear", align_corners=False)
 
-@register_model
-def convnext_small(pretrained=False,in_22k=False, **kwargs):
-    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[96, 192, 384, 768], **kwargs)
-    if pretrained:
-        url = model_urls['convnext_small_22k'] if in_22k else model_urls['convnext_small_1k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-    return model
+        out = self.catconv(new_feat1 + new_feat2 + new_feat3 + new_feat4)
 
-@register_model
-def convnext_base(pretrained=False, in_22k=False, **kwargs):
-    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[128, 256, 512, 1024], **kwargs)
-    if pretrained:
-        url = model_urls['convnext_base_22k'] if in_22k else model_urls['convnext_base_1k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-    return model
-
-@register_model
-def convnext_large(pretrained=False, in_22k=False, **kwargs):
-    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[192, 384, 768, 1536], **kwargs)
-    if pretrained:
-        url = model_urls['convnext_large_22k'] if in_22k else model_urls['convnext_large_1k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-    return model
-
-@register_model
-def convnext_xlarge(pretrained=False, in_22k=False, **kwargs):
-    model = ConvNeXt(depths=[3, 3, 27, 3], dims=[256, 512, 1024, 2048], **kwargs)
-    if pretrained:
-        assert in_22k, "only ImageNet-22K pre-trained ConvNeXt-XL is available; please set in_22k=True"
-        url = model_urls['convnext_xlarge_22k']
-        checkpoint = torch.hub.load_state_dict_from_url(url=url, map_location="cpu")
-        model.load_state_dict(checkpoint["model"])
-    return model
+        return [out, pred1]
